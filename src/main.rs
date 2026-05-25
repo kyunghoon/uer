@@ -35,6 +35,24 @@ impl Variant {
     }
 }
 
+pub fn get_project_name() -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let current_dir = std::env::current_dir()?;
+    if let Ok(entries) = std::fs::read_dir(current_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            
+            // 3. Check if the file has the .uproject extension
+            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("uproject") {
+                // 4. Extract the file stem (e.g., "Gamebit" from "Gamebit.uproject")
+                if let Some(project_name) = path.file_stem().and_then(|s| s.to_str()) {
+                    return Ok(Some(project_name.to_owned()));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Unreal Engine Rust Plugin Builder", long_about = None)]
 struct Cli {
@@ -275,10 +293,9 @@ fn try_main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Bindgen => {
             genbindings::generate(
-                Path::new("/Users/kyunghoon/dev/Gamebit/capi.toml"),
-                Path::new("/Users/kyunghoon/dev/Gamebit/rsapi.toml"),
-                Path::new("/Users/kyunghoon/dev/Gamebit/src"),
-                Path::new("/Users/kyunghoon/dev/Gamebit/Plugins/UERustPlugin"),
+                &ue_project_dir.join("api.toml"),
+                &ue_project_dir.join("src"),
+                get_project_name()?.map(|name| ue_project_dir.join("Source").join(name)),
             )?;
         }
     }

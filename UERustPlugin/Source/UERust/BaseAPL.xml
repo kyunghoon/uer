@@ -1,0 +1,26 @@
+<root xmlns:android="http://schemas.android.com/apk/res/android">
+<!-- For documentation on what this file does see https://forums.unrealengine.com/development-discussion/android-development/76381-how-do-i-include-native-libraries-from-a-plugin -->
+<!-- The basic idea is that this file tells what static libraries actually need to be copied into the final apk -->
+<!-- Also added the android permission for INTERNET because if you are using this sdk there is a 99% chance you want to use the internet -->
+<!-- init section is always evaluated once per architecture -->
+<init>
+</init>
+
+<!-- Copy files to the intermediate folder for the build process-->
+<resourceCopies>
+    <log text="Copying libUERust.so from to Intermediate"/>
+    <copyFile src="$S(PluginDir)/Android/$S(Architecture)/libUERust.so"
+        dst="$S(BuildDir)/libs/$S(Architecture)/libUERust.so" />
+</resourceCopies>
+
+<!-- optional libraries to load in GameActivity.java before libUE4.so -->
+<soLoadLibrary>
+    <!-- Libraries have to be loaded in this orderd because they depend on eachother-->
+    <loadLibrary name="UERust" failmsg="Did not load libUERust library" />
+</soLoadLibrary>
+
+<androidManifestUpdates>
+    <!-- Added this because if you are using this plugin you are probably going to use the internet-->
+    <addPermission android:name="android.permission.INTERNET"/>
+</androidManifestUpdates>
+</root>

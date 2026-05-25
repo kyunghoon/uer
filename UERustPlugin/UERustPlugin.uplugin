@@ -1,0 +1,15 @@
+{
+    "FileVersion": 3,
+    "Version": 1,
+    "VersionName": "1.0",
+    "FriendlyName": "UERustPlugin",
+    "CreatedBy": "kyunghoon",
+    "EnabledByDefault" : true,
+    "Plugins": [],
+    "Modules": [{
+        "Name": "UERust",
+        "Type": "Runtime",
+        "LoadingPhase": "Default",
+        "WhitelistPlatforms": ["Win64", "Mac", "Android"]
+    }]
+}
