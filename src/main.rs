@@ -1,4 +1,6 @@
-use std::path::{Path, PathBuf};
+mod genbindings;
+
+use std::{path::{Path, PathBuf}};
 use clap::{Parser, Subcommand};
 use xshell::{Shell, cmd};
 
@@ -36,9 +38,11 @@ impl Variant {
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Unreal Engine Rust Plugin Builder", long_about = None)]
 struct Cli {
-    /// Path to the Unreal Engine project directory (e.g., /path/to/MyProject)
-    #[arg(long, required = true)]
-    ue_project_dir: PathBuf,
+    /// Path to the Unreal Engine project directory (e.g., /path/to/MyProject).
+    /// If not provided, auto-detected from nearest .uproject file (upward search),
+    /// or falls back to $UE_PROJECT_DIR env var.
+    #[arg(long)]
+    ue_project_dir: Option<PathBuf>,
 
     /// Name of the plugin (e.g., UERustPlugin)
     #[arg(long, default_value = "UERustPlugin")]
@@ -72,8 +76,8 @@ enum Commands {
     /// Build for Android (requires NDK)
     Android {
         /// Android NDK root directory
-        #[arg(long, required = true)]
-        android_ndk_root: PathBuf,
+        #[arg(long)]
+        android_ndk_root: Option<PathBuf>,
 
         /// ABI (e.g., arm64-v8a, armeabi-v7a)
         #[arg(long, default_value = "arm64-v8a")]
@@ -91,6 +95,7 @@ enum Commands {
         #[arg(long, default_value = "UERust")]
         module_name: String,
     },
+    Bindgen,
 }
 
 struct PluginParams<'a> {
@@ -135,13 +140,15 @@ fn build_module(
     module_name: &str,
     module_params: &ModuleParams,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    sh.change_dir(module_name);
+    // sh.change_dir(module_name);
     sh.set_var("MODULE_NAME", module_name);
 
     let module_name = module_name;
     let variant = format!("{}", plugin_params.variant.as_str().to_lowercase());
 
     let mut flags = vec![];
+    // flags.push("--lib=UERust".to_string());
+
     if let Some(target_triple) = module_params.target_triple {
         flags.push(format!("--target={target_triple}"));
     }
@@ -153,7 +160,7 @@ fn build_module(
 
     let lib_name = module_params.target_os.lib_name(module_name);
     if matches!(module_params.target_os, TargetOS::Mac) {
-        cmd!(sh, "install_name_tool -id @rpath/{lib_name}.dylib ../target/{variant}/{lib_name}.dylib").run()?;
+        cmd!(sh, "install_name_tool -id @rpath/{lib_name}.dylib ./target/{variant}/{lib_name}.dylib").run()?;
     }
 
     let mut dst_dir = ue_project_dir
@@ -183,17 +190,41 @@ fn main() {
 fn try_main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    let ue_project_dir = &cli.ue_project_dir;
-    let plugin_params = PluginParams {
-        name: &cli.plugin_name,
-        variant: match &cli.command {
-            Commands::Build { variant, .. } => *variant,
-            Commands::Android { variant, .. } => *variant,
-        },
+    // Resolve ue_project_dir: cli arg > env > auto-discover
+    let ue_project_dir = {
+        if let Some(p) = &cli.ue_project_dir {
+            p.clone()
+        } else if let Ok(val) = std::env::var("UE_PROJECT_DIR") {
+            PathBuf::from(val)
+        } else {
+            // Search upward for any *.uproject file
+            let mut dir = std::env::current_dir()?;
+            let ue_dir = 'outer: loop {
+                if let Ok(entries) = std::fs::read_dir(&dir) {
+                    for entry in entries.filter_map(Result::ok) {
+                        let path = entry.path();
+                        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("uproject") {
+                            break 'outer Some(dir.clone());
+                        }
+                    }
+                }
+                if !dir.pop() {
+                    break 'outer None;
+                }
+            };
+            let Some(dir) = ue_dir else {
+                return Err("No .uproject file found in current or parent directories, and UE_PROJECT_DIR not set".into());
+            };
+            dir
+        }
     };
 
     match &cli.command {
-        Commands::Build { target_os, target_triple, module_name, .. } => {
+        Commands::Build { variant, target_os, target_triple, module_name } => {
+            let plugin_params = PluginParams {
+                name: &cli.plugin_name,
+                variant: *variant,
+            };
             // Auto-detect target_os if not specified
             let target_os = target_os.clone().unwrap_or_else(|| {
                 if cfg!(target_os = "macos") { TargetOS::Mac }
@@ -211,9 +242,11 @@ fn try_main() -> Result<(), Box<dyn std::error::Error>> {
             sh.set_var("UE_PROJECT_DIR", &ue_project_dir);
             sh.set_var("PLUGIN_NAME", &cli.plugin_name);
 
-            build_module(sh, ue_project_dir, &plugin_params, module_name, &module_params)?;
+            build_module(sh, &ue_project_dir, &plugin_params, module_name, &module_params)?;
         }
-        Commands::Android { android_ndk_root, abi, target_triple, module_name, .. } => {
+        Commands::Android { android_ndk_root, abi, target_triple, module_name, variant } => {
+            let plugin_params = PluginParams { name: &cli.plugin_name, variant: *variant };
+
             let module_params = ModuleParams {
                 abi: Some(abi.as_str()),
                 target_os: TargetOS::Android,
@@ -224,14 +257,31 @@ fn try_main() -> Result<(), Box<dyn std::error::Error>> {
             sh.set_var("UE_PROJECT_DIR", &ue_project_dir);
             sh.set_var("PLUGIN_NAME", &cli.plugin_name);
 
-            let ndk_root = android_ndk_root;
+            let ndk_root = {
+                if let Some(p) = &android_ndk_root {
+                    p.clone()
+                } else if let Ok(val) = std::env::var("ANDROID_NDK_ROOT") {
+                    PathBuf::from(val)
+                } else {
+                    return Err("No .uproject file found in current or parent directories, and UE_PROJECT_DIR not set".into());
+                }
+            };
             let path = sh.var("PATH")?;
             sh.set_var("PATH", format!("{}/toolchains/llvm/prebuilt/darwin-x86_64/bin:{}", ndk_root.display(), path));
             sh.set_var("CC_aarch64_linux_android", "aarch64-linux-android21-clang");
             sh.set_var("CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER", "aarch64-linux-android21-clang");
 
-            build_module(sh, ue_project_dir, &plugin_params, module_name, &module_params)?;
+            build_module(sh, &ue_project_dir, &plugin_params, module_name, &module_params)?;
+        }
+        Commands::Bindgen => {
+            genbindings::generate(
+                Path::new("/Users/kyunghoon/dev/Gamebit/capi.toml"),
+                Path::new("/Users/kyunghoon/dev/Gamebit/rsapi.toml"),
+                Path::new("/Users/kyunghoon/dev/Gamebit/src"),
+                Path::new("/Users/kyunghoon/dev/Gamebit/Plugins/UERustPlugin"),
+            )?;
         }
     }
+
     Ok(())
 }
