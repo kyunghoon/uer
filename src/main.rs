@@ -1,10 +1,10 @@
-use std::{env, path::{Path, PathBuf}};
+use std::path::{Path, PathBuf};
+use clap::{Parser, Subcommand};
 use xshell::{Shell, cmd};
 
-type DynError = Box<dyn std::error::Error>;
-type Result<T> = std::result::Result<T, DynError>;
-
 const MULTI_MODULES: bool = true;
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetOS { Mac, Android, Win64 }
 impl TargetOS {
     fn as_str(&self) -> &str {
@@ -22,6 +22,7 @@ impl TargetOS {
     }
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Variant { Debug, Release }
 impl Variant {
     fn as_str(&self) -> &str {
@@ -30,6 +31,66 @@ impl Variant {
             Variant::Release => "Release",
         }
     }
+}
+
+#[derive(Parser, Debug)]
+#[command(author, version, about = "Unreal Engine Rust Plugin Builder", long_about = None)]
+struct Cli {
+    /// Path to the Unreal Engine project directory (e.g., /path/to/MyProject)
+    #[arg(long, required = true)]
+    ue_project_dir: PathBuf,
+
+    /// Name of the plugin (e.g., UERustPlugin)
+    #[arg(long, default_value = "UERustPlugin")]
+    plugin_name: String,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Build for the host platform (Mac, Win64, etc.)
+    Build {
+        /// Target OS (defaults to host OS)
+        #[arg(long, value_enum)]
+        target_os: Option<TargetOS>,
+
+        /// Target triple for cross-compilation (e.g., x86_64-apple-darwin)
+        #[arg(long)]
+        target_triple: Option<String>,
+
+        /// Build variant: debug or release
+        #[arg(long, value_enum, default_value = "debug")]
+        variant: Variant,
+
+        /// Module name (default: UERust)
+        #[arg(long, default_value = "UERust")]
+        module_name: String,
+    },
+
+    /// Build for Android (requires NDK)
+    Android {
+        /// Android NDK root directory
+        #[arg(long, required = true)]
+        android_ndk_root: PathBuf,
+
+        /// ABI (e.g., arm64-v8a, armeabi-v7a)
+        #[arg(long, default_value = "arm64-v8a")]
+        abi: String,
+
+        /// Target triple (e.g., aarch64-linux-android)
+        #[arg(long, default_value = "aarch64-linux-android")]
+        target_triple: String,
+
+        /// Build variant: debug or release
+        #[arg(long, value_enum, default_value = "debug")]
+        variant: Variant,
+
+        /// Module name (default: UERust)
+        #[arg(long, default_value = "UERust")]
+        module_name: String,
+    },
 }
 
 struct PluginParams<'a> {
@@ -43,7 +104,7 @@ struct ModuleParams<'a> {
     target_triple: Option<&'a str>,
 }
 
-fn copy_files_by_primary_stem(source: &Path, dest: &Path, target_stem: &str) -> Result<()> {
+fn copy_files_by_primary_stem(source: &Path, dest: &Path, target_stem: &str) -> Result<(), Box<dyn std::error::Error>> {
     if !source.is_dir() { 
         return Err(format!("Source not found: {}", source.display()).into()); 
     }
@@ -67,7 +128,13 @@ fn copy_files_by_primary_stem(source: &Path, dest: &Path, target_stem: &str) -> 
     Ok(())
 }
 
-fn build_module(sh: Shell, ue_project_dir: &Path, plugin_params: &PluginParams, module_name: &str, module_params: &ModuleParams) -> Result<()> {
+fn build_module(
+    sh: Shell,
+    ue_project_dir: &Path,
+    plugin_params: &PluginParams,
+    module_name: &str,
+    module_params: &ModuleParams,
+) -> Result<(), Box<dyn std::error::Error>> {
     sh.change_dir(module_name);
     sh.set_var("MODULE_NAME", module_name);
 
@@ -106,12 +173,6 @@ fn build_module(sh: Shell, ue_project_dir: &Path, plugin_params: &PluginParams, 
     Ok(())
 }
 
-fn print_help() {
-    eprintln!("Tasks:
-    build           compiles plugin
-    android         compiles plugin for android");
-}
-
 fn main() {
     if let Err(e) = try_main() {
         eprintln!("{}", e);
@@ -119,49 +180,58 @@ fn main() {
     }
 }
 
-fn try_main() -> Result<()> {
-    let ue_project_dir = std::path::PathBuf::from(&std::env::var("UE_PROJECT_DIR")
-        .expect("UE_PROJECT_DIR is not set. Please define it in the .env file or pass it as an argument"));
+fn try_main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
 
+    let ue_project_dir = &cli.ue_project_dir;
     let plugin_params = PluginParams {
-        name: "UERustPlugin",
-        variant: Variant::Debug,
+        name: &cli.plugin_name,
+        variant: match &cli.command {
+            Commands::Build { variant, .. } => *variant,
+            Commands::Android { variant, .. } => *variant,
+        },
     };
 
-    match env::args().nth(1).as_deref() {
-        Some("build") => {
-            #[cfg(target_os = "macos")]
-            let target_os = TargetOS::Mac;
-            #[cfg(target_os = "windows")]
-            let target_os = TargetOS::Win64;
+    match &cli.command {
+        Commands::Build { target_os, target_triple, module_name, .. } => {
+            // Auto-detect target_os if not specified
+            let target_os = target_os.clone().unwrap_or_else(|| {
+                if cfg!(target_os = "macos") { TargetOS::Mac }
+                else if cfg!(target_os = "windows") { TargetOS::Win64 }
+                else { panic!("Unsupported host OS") }
+            });
 
-            let module_params = ModuleParams { abi: None, target_os, target_triple: None };
-            let sh = Shell::new()?;
-            sh.set_var("UE_PROJECT_DIR", &ue_project_dir);
-            sh.set_var("PLUGIN_NAME", plugin_params.name);
-
-            build_module(sh, &ue_project_dir, &plugin_params, "UERust", &module_params)?;
-        },
-        Some("android") => {
             let module_params = ModuleParams {
-                abi: Some("arm64-v8a"),
-                target_os: TargetOS::Android,
-                target_triple: Some("aarch64-linux-android"),
+                abi: None,
+                target_os,
+                target_triple: target_triple.as_deref(),
             };
 
             let sh = Shell::new()?;
             sh.set_var("UE_PROJECT_DIR", &ue_project_dir);
-            sh.set_var("PLUGIN_NAME", plugin_params.name);
+            sh.set_var("PLUGIN_NAME", &cli.plugin_name);
 
-            let ndk_root = sh.var("ANDROID_NDK_ROOT")?;
+            build_module(sh, ue_project_dir, &plugin_params, module_name, &module_params)?;
+        }
+        Commands::Android { android_ndk_root, abi, target_triple, module_name, .. } => {
+            let module_params = ModuleParams {
+                abi: Some(abi.as_str()),
+                target_os: TargetOS::Android,
+                target_triple: Some(target_triple.as_str()),
+            };
+
+            let sh = Shell::new()?;
+            sh.set_var("UE_PROJECT_DIR", &ue_project_dir);
+            sh.set_var("PLUGIN_NAME", &cli.plugin_name);
+
+            let ndk_root = android_ndk_root;
             let path = sh.var("PATH")?;
-            sh.set_var("PATH", format!("{ndk_root}/toolchains/llvm/prebuilt/darwin-x86_64/bin:{path}"));
+            sh.set_var("PATH", format!("{}/toolchains/llvm/prebuilt/darwin-x86_64/bin:{}", ndk_root.display(), path));
             sh.set_var("CC_aarch64_linux_android", "aarch64-linux-android21-clang");
             sh.set_var("CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER", "aarch64-linux-android21-clang");
 
-            build_module(sh, &ue_project_dir, &plugin_params, "UERust", &module_params)?;
+            build_module(sh, ue_project_dir, &plugin_params, module_name, &module_params)?;
         }
-        _ => print_help(),
     }
     Ok(())
 }
