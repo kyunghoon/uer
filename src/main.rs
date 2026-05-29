@@ -113,7 +113,7 @@ enum Commands {
         #[arg(long, default_value = "UERust")]
         module_name: String,
     },
-    Bindgen,
+    Gen,
 }
 
 struct PluginParams<'a> {
@@ -291,9 +291,9 @@ fn try_main() -> Result<(), Box<dyn std::error::Error>> {
 
             build_module(sh, &ue_project_dir, &plugin_params, module_name, &module_params)?;
         }
-        Commands::Bindgen => {
+        Commands::Gen => {
             genbindings::generate(
-                &ue_project_dir.join("api.toml"),
+                &ue_project_dir.join("api.json"),
                 &ue_project_dir.join("src"),
                 get_project_name()?.map(|name| ue_project_dir.join("Source").join(name)),
             )?;

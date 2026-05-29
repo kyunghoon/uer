@@ -1,3 +1,5 @@
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::{fs, path::PathBuf};
 use std::path::Path;
 use include_dir::{include_dir, Dir};
@@ -47,73 +49,126 @@ impl TypeSpec {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct Arg {
+    #[serde(flatten)]
+    inner: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FuncEntry {
+    #[serde(default)]
+    doc: String,
+    #[serde(default)]
+    ret: Option<String>,
+    #[serde(default)]
+    args: Vec<Arg>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiSchema {
+    cfunc: HashMap<String, FuncEntry>,
+    rfunc: HashMap<String, FuncEntry>,
+}
+
 #[derive(Debug)]
 struct FuncSpec {
     name: String,
-    args: Vec<(String, TypeSpec)>,
+    args: Vec<(String, TypeSpec)>, // Assuming TypeSpec::from_rust_type exists
     ret: TypeSpec,
     doc: String,
 }
 
-fn parse_api_func(func: &toml::Value, i: usize, tag: &str) -> Result<FuncSpec, String> {
-    let table = func.as_table().ok_or(format!("api.toml: {}[{}] must be a table", tag, i))?;
+fn parse_api_json(path: &Path) -> Result<(Vec<FuncSpec>, Vec<FuncSpec>), String> {
+    let content = fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read file `{:?}`: {}", path, e))?;
+    let data: ApiSchema = serde_json::from_str(&content)
+        .map_err(|e| format!("Invalid JSON: {}", e))?;
 
-    let name = table
-        .get("name")
-        .and_then(|v| v.as_str())
-        .ok_or(format!("api.toml: {}[{}] missing 'name'", tag, i))?;
-    let args = table
-        .get("args")
-        .and_then(|v| v.as_array().map(|v|
-            v.iter().map(|i| i.as_table().and_then(|t| t.iter().next()))
-            .collect::<Option<Vec<_>>>()).unwrap_or_default())
-        .ok_or(format!("api.toml: {}[{}] missing 'args' in {}", tag, i, name))?;
-    let ret = table
-        .get("ret")
-        .and_then(|v| v.as_str())
-        .unwrap_or("()");
-    let doc = table.get("doc").and_then(|v| v.as_str()).unwrap_or("");
+    let process_map = |map: HashMap<String, FuncEntry>| -> Result<Vec<FuncSpec>, String> {
+        map.into_iter().map(|(name, entry)| {
+            let mut args_spec = Vec::new();
+            for arg in entry.args {
+                for (key, ty) in arg.inner {
+                    args_spec.push((key, TypeSpec::from_rust_type(&ty)?));
+                }
+            }
+            
+            Ok(FuncSpec {
+                name,
+                args: args_spec,
+                ret: TypeSpec::from_rust_type(&entry.ret.unwrap_or_else(|| "()".to_string()))?,
+                doc: entry.doc,
+            })
+        }).collect()
+    };
 
-    let mut args_spec = Vec::new();
-    for (j, (key, arg)) in args.iter().enumerate() {
-        let ty = arg.as_str().ok_or(format!("api.toml: {}[{}] arg[{}] must be string", tag, i, j))?;
-        args_spec.push(((*key).to_owned(), TypeSpec::from_rust_type(ty)?));
-    }
-    let ret_spec = TypeSpec::from_rust_type(ret)?;
+    let mut cfuncs = process_map(data.cfunc)?;
+    let mut rfuncs = process_map(data.rfunc)?;
 
-    Ok(FuncSpec {
-        name: name.to_string(),
-        args: args_spec,
-        ret: ret_spec,
-        doc: doc.to_string(),
-    })
-}
+    cfuncs.push(FuncSpec {
+        name: "uerust_log".to_owned(),
+        args: vec![
+            ("a0".to_owned(), TypeSpec::from_rust_type("&str")?),
+            ("a1".to_owned(), TypeSpec::from_rust_type("u8")?),
+        ],
+        ret: TypeSpec::from_rust_type("()")?,
+        doc: "".to_owned(),
+    });
 
-fn parse_api_toml(capi:& Path) -> Result<(Vec<FuncSpec>, Vec<FuncSpec>), String> {
-    let toml = fs::read_to_string(capi)
-        .map_err(|e| format!("failed to read ./api.toml: {}", e))?;
-    let value: toml::Value = toml::from_str(&toml)
-        .map_err(|e| format!("invalid ./api.toml TOML: {}", e))?;
+    rfuncs.push(FuncSpec {
+        name: "uerust_loaded".to_owned(),
+        args: vec![("a0".to_owned(), TypeSpec::from_rust_type("bool")?)],
+        ret: TypeSpec::from_rust_type("()")?,
+        doc: "".to_owned(),
+    });
 
-    let mut parsed_cfuncs = Vec::new();
-    if let Some(cfuncs) = &&value.as_table().and_then(|t| t.get("cfunc")).and_then(|v| v.as_array()) {
-        for (i, func) in cfuncs.iter().enumerate() {
-            parsed_cfuncs.push(parse_api_func(func, i, "cfunc")?);
-        }
-    }
+    cfuncs.sort_by(|a, b| a.name.cmp(&b.name));
+    rfuncs.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let mut parsed_rfuncs = Vec::new();
-    if let Some(rfuncs) = &&value.as_table().and_then(|t| t.get("rfunc")).and_then(|v| v.as_array()) {
-        for (i, func) in rfuncs.iter().enumerate() {
-            parsed_rfuncs.push(parse_api_func(func, i, "rfunc")?);
-        }
-    }
-
-    Ok((parsed_cfuncs, parsed_rfuncs))
+    Ok((cfuncs, rfuncs))
 }
 
 pub fn generate(api: &Path, rs_output_dir: &Path, project_module_dir: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
-    let funcs = parse_api_toml(api)?;
+    let api_dst_path = std::env::current_dir()?.join("api.json");
+    if !api_dst_path.exists() {
+        let mut api = String::new();
+        api.push_str(r#"{
+    "$schema": "https://raw.githubusercontent.com/kyunghoon/uer/refs/heads/main/schema.json",
+    "cfunc": {},
+    "rfunc": {}
+}"#);
+        fs::write(api_dst_path, api)?;
+    }
+
+    let cargo_dst_path = std::env::current_dir()?.join("Cargo.toml");
+    if !cargo_dst_path.exists() {
+        let mut cargo = String::new();
+        cargo.push_str(&format!(r#"[package]
+name = "{}"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+"#, crate::get_project_name()?.unwrap()));
+        fs::write(cargo_dst_path, cargo)?;
+    }
+
+    let rust_src_path = std::env::current_dir()?.join("src");
+    if !rust_src_path.exists() {
+        let mut src = String::new();
+            src.push_str("fn uerust_loaded(is_reload: bool) {\n");
+            src.push_str("    logger::init();\n");
+            src.push_str("    log::warn!(\"module was {}.\", if is_reload { \"reloaded\" } else { \"loaded\" });\n");
+            src.push_str("}\n");
+        fs::create_dir_all(&rust_src_path)?;
+        fs::write(rust_src_path.join("lib.rs"), src)?;
+    }
+
+    let funcs = parse_api_json(api)?;
 
     // --- Generate ./src/bindings.rs ---
     let mut rust = String::new();
@@ -446,7 +501,7 @@ macro_rules! uerust_ffi {
         h.push_str("public:\n");
         h.push_str("    UERustApi(UUERustPluginEngineSubsystem& s);\n");
         for func in funcs.1.iter() {
-            let args = func.args.iter().enumerate().map(|(n, (k, v))| format!("{} {}", v.c_type, k)).collect::<Vec<_>>().join(", ");
+            let args = func.args.iter().map(|(k, v)| format!("{} {}", v.c_type, k)).collect::<Vec<_>>().join(", ");
             h.push_str(&format!("    {} {}({});\n", func.ret.c_type, func.name, args));
         }
         h.push_str("};\n\n");
@@ -456,6 +511,7 @@ macro_rules! uerust_ffi {
         h.push_str("public:\n");
         h.push_str("    TOptional<UERustApi> RApi;\n");
         h.push_str("public:\n");
+        h.push_str("    virtual ~FUERustModuleImpl() {}\n\n");
         h.push_str("    virtual void StartupModule() override;\n");
         h.push_str("    virtual void ShutdownModule() override;\n");
         h.push_str("protected:\n");
@@ -471,7 +527,11 @@ macro_rules! uerust_ffi {
             .enumerate().map(|(i, v)| format!("{v} a{i}"))
             .collect::<Vec<_>>().join(", ");
             let ret = if func.ret.rust_type == "()" { "void" } else { func.ret.c_type };
-            h.push_str(&format!("    virtual {} uerust_{}({}) = 0;\n", ret, func.name, params));
+            if func.name == "uerust_log" {
+                h.push_str(&format!("    virtual {} {}({});\n", ret, func.name, params));
+            } else {
+                h.push_str(&format!("    virtual {} {}({}) = 0;\n", ret, func.name, params));
+            }
         }
 
         h.push_str("};\n");
@@ -516,7 +576,7 @@ macro_rules! uerust_ffi {
         cpp.push_str("                Subsystem->SetOnLoaded([this](UUERustPluginEngineSubsystem& subsystem, bool isReload) {\n");
         cpp.push_str("                    RApi.Emplace(UERustApi(subsystem));\n");
         cpp.push_str("                    if (RApi.IsSet()) {\n");
-        cpp.push_str("                        RApi.GetValue().loaded(isReload);\n");
+        cpp.push_str("                        RApi.GetValue().uerust_loaded(isReload);\n");
         cpp.push_str("                    }\n\n");
                         
         cpp.push_str("                    subsystem.OnInvoke = [this](uint16_t method_id, Argument const* args, size_t num_args) {\n");
@@ -535,7 +595,7 @@ macro_rules! uerust_ffi {
 
             let args = func.args.iter().map(|(k, v)| if v.is_buf_like { format!("{0}_data, {0}_len", k) } else { format!("{}", k) }).collect::<Vec<String>>().join(", ");
             if func.ret.rust_type == "()" {
-                cpp.push_str(&format!("                            uerust_{}({});\n", func.name, args));
+                cpp.push_str(&format!("                            {}({});\n", func.name, args));
                 cpp.push_str("                            return Return { .is_some = false };\n");
             } else {
                 cpp.push_str(&format!("                            return Return {{ .is_some = true, .value = Argument {{ .tag = ArgTag::{}, .value = ArgType {{ .{}_val = uerust_{}({}) }} }} }};\n", func.ret.tag, func.ret.rust_type, func.name, args));
@@ -561,8 +621,9 @@ macro_rules! uerust_ffi {
         cpp.push_str("}\n\n");
 
         cpp.push_str("UERustApi::UERustApi(UUERustPluginEngineSubsystem& s) : subsystem(&s) {}\n\n");
+
         for func in funcs.1.iter() {
-            let args = func.args.iter().enumerate().map(|(n, (k, v))| format!("{} {}", v.c_type, k)).collect::<Vec<_>>().join(", ");
+            let args = func.args.iter().map(|(k, v)| format!("{} {}", v.c_type, k)).collect::<Vec<_>>().join(", ");
             cpp.push_str(&format!("{} UERustApi::{}({}) {{\n", func.ret.c_type, func.name, args));
             if func.args.is_empty() {
                 cpp.push_str("    Argument args[] = {};\n");
@@ -571,7 +632,7 @@ macro_rules! uerust_ffi {
                 cpp.push_str(&format!("    Argument args[] = {{ Argument {{ .tag = ArgTag::{}, .value = ArgType {{ .{}_val = {} }} }}, }};\n", fst.tag, fst.tag.to_lowercase(), key));
             } else {
                 cpp.push_str("    Argument args[] = {\n");
-                for (n, (key, arg)) in func.args.iter().enumerate() {
+                for (key, arg) in func.args.iter() {
                     cpp.push_str(&format!("        Argument {{ .tag = ArgTag::{}, .value = ArgType {{ .{}_val = {} }} }},\n", arg.tag, arg.tag.to_lowercase(), key));
                 }
                 cpp.push_str("    };\n");
@@ -583,6 +644,25 @@ macro_rules! uerust_ffi {
             }
             cpp.push_str("}\n");
         }
+
+        cpp.push_str("\n");
+        cpp.push_str("void FUERustModuleImpl::uerust_log(uint8_t const* a0, uintptr_t a1, uint8_t lvl)\n");
+        cpp.push_str("{\n");
+        cpp.push_str("    auto data = (char const*)a0;\n");
+        cpp.push_str("    auto len = (int)a1;\n");
+        cpp.push_str("    if (lvl == 4) { // Error\n");
+        cpp.push_str("        UE_LOG(LogTemp, Error, TEXT(\"%s\"), *FString::Printf(TEXT(\"%.*s\"), len, ANSI_TO_TCHAR(data)));\n");
+        cpp.push_str("    } else if (lvl == 3) { // Warn\n");
+        cpp.push_str("        UE_LOG(LogTemp, Warning, TEXT(\"%s\"), *FString::Printf(TEXT(\"%.*s\"), len, ANSI_TO_TCHAR(data)));\n");
+        cpp.push_str("    } else if (lvl == 2) { // Info \n");
+        cpp.push_str("        UE_LOG(LogTemp, Display, TEXT(\"%s\"), *FString::Printf(TEXT(\"%.*s\"), len, ANSI_TO_TCHAR(data)));\n");
+        cpp.push_str("    } else if (lvl == 1) { // Debug\n");
+        cpp.push_str("        UE_LOG(LogTemp, Log, TEXT(\"%s\"), *FString::Printf(TEXT(\"%.*s\"), len, ANSI_TO_TCHAR(data)));\n");
+        cpp.push_str("    } else { // Trace\n");
+        cpp.push_str("        UE_LOG(LogTemp, Verbose, TEXT(\"%s\"), *FString::Printf(TEXT(\"%.*s\"), len, ANSI_TO_TCHAR(data)));\n");
+        cpp.push_str("    }\n");
+        cpp.push_str("}\n\n");
+
 
         let priv_dir = dir.join("Private");
         fs::create_dir_all(&priv_dir)?;

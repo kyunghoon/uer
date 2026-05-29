@@ -1,0 +1,34 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "required": ["cfunc", "rfunc"],
+    "$defs": {
+      "types": {
+        "enum": ["bool", "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "f32", "f64", "*f64", "*mut f64", "usize", "isize", "c_void", "*c_void", "*mut c_void", "*u8", "&str"]
+      },
+      "arg_item": {
+        "type": "object",
+        "minProperties": 1,
+        "maxProperties": 1,
+        "patternProperties": {
+          ".*": { "$ref": "#/$defs/types" }
+        }
+      },
+      "func_def": {
+        "type": "object",
+        "required": ["args"],
+        "properties": {
+          "doc": { "type": "string" },
+          "ret": { "$ref": "#/$defs/types" },
+          "args": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/arg_item" }
+          }
+        }
+      }
+    },
+    "properties": {
+      "cfunc": { "patternProperties": { ".*": { "$ref": "#/$defs/func_def" } } },
+      "rfunc": { "patternProperties": { ".*": { "$ref": "#/$defs/func_def" } } }
+    }
+  }

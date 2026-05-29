@@ -9,7 +9,6 @@ public class UERust : ModuleRules
 
         PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
 
-        PublicDependencyModuleNames.AddRange(new string[] { "PCG" });
         PrivateDependencyModuleNames.AddRange(new string[] { "Core","CoreUObject","Engine" });
 
 
@@ -33,4 +32,4 @@ public class UERust : ModuleRules
             RuntimeDependencies.Add(System.IO.Path.Combine(MacPath, "libUERust.dylib"));
         }
     }
-}
+}
